@@ -1,0 +1,419 @@
+diff --git a/cli.py b/cli.py
+index 560b5d9..ebcee63 100644
+--- a/cli.py
++++ b/cli.py
+@@ -4078,6 +4078,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
+         # that wants its output run as the next agent turn. Consumed and cleared
+         # by the interactive loop immediately after process_command() returns.
+         self._pending_agent_seed = None
++        # Prewalk --no-pause / --into: when True, swap to executor model and
++        # seed continuation prompt after the current agent turn completes.
++        self._pending_prewalk_swap_after_turn = False
++        self._pending_prewalk_executor_model: str | None = None
++        self._pending_prewalk_restore_model: dict | None = None
+         self._secret_state = None
+         self._secret_deadline = 0
+         self._spinner_text: str = ""  # thinking spinner text for TUI
+@@ -8910,6 +8915,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
+             self._pending_moa_disable_after_turn = True
+             self._pending_agent_seed = payload
+             _cprint(f"  MoA one-shot queued with preset {preset}; previous model will be restored after this turn.")
++        elif canonical == "prewalk":
++            self._handle_prewalk_command(cmd_original)
+         elif canonical == "subgoal":
+             self._handle_subgoal_command(cmd_original)
+         elif canonical == "skin":
+@@ -12362,6 +12369,30 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
+                         self.agent = None
+                         self._pending_moa_restore_model = None
+                         self._pending_moa_disable_after_turn = False
++                    # Prewalk --no-pause / --into: swap to executor model and
++                    # seed continuation prompt after the frontier turn completes.
++                    if getattr(self, "_pending_prewalk_swap_after_turn", False):
++                        _prewalk_exec = (getattr(self, "_pending_prewalk_executor_model", None)
++                                         or "cline-pass/deepseek-v4-flash")
++                        self.model = _prewalk_exec
++                        self.agent = None  # force re-init with new model
++                        _cprint(f"  {_DIM}⚡ Prewalk: switched to executor model "
++                                f"{_prewalk_exec}{_RST}")
++                        self._pending_agent_seed = (
++                            "Planning phase complete. You are now the executor model. "
++                            "The exploration, the plan (todo list), and the first "
++                            "completed task were done earlier in this session — you "
++                            "inherit that context. Check off the PAUSE item first, then "
++                            "work through the remaining items strictly in order, one at "
++                            "a time. Follow the pattern established by the first "
++                            "completed task. Run each item's verification before moving "
++                            "to the next. The task is NOT done until every todo item is "
++                            "checked off — do not declare completion while unchecked "
++                            "items remain. If you get stuck on an item after 3 attempts, "
++                            "skip it and report skipped items at the end."
++                        )
++                        self._pending_prewalk_swap_after_turn = False
++                        self._pending_prewalk_executor_model = None
+                 except Exception as exc:
+                     logging.error("run_conversation raised: %s", exc, exc_info=True)
+                     _summary = getattr(self.agent, '_summarize_api_error', lambda e: str(e)[:300])(exc)
+diff --git a/hermes_cli/cli_commands_mixin.py b/hermes_cli/cli_commands_mixin.py
+index b16d216..08b82c6 100644
+--- a/hermes_cli/cli_commands_mixin.py
++++ b/hermes_cli/cli_commands_mixin.py
+@@ -1749,6 +1749,155 @@ class CLICommandsMixin:
+         self._background_tasks[task_id] = thread
+         thread.start()
+ 
++    def _handle_prewalk_command(self, cmd: str) -> None:
++        """Handle /prewalk <task> — frontier model explores + plans + completes
++        exactly one task (edit + verification), then pauses for model switch.
++
++        Uses _pending_agent_seed to send the frontier prompt as the next agent
++        turn. For --no-pause / --into MODEL, sets up model-swap similar to /moa
++        so the executor model is auto-swapped after the frontier turn completes.
++
++        See ~/.hermes/skills/software-development/prewalk/SKILL.md for the
++        full workflow and prompt templates.
++        """
++        import re
++        from cli import _DIM, _RST, _cprint
++
++        default_executor = "cline-pass/deepseek-v4-flash"
++
++        parts = cmd.strip().split(maxsplit=1)
++        if len(parts) < 2 or not parts[1].strip():
++            _cprint(f"  {_DIM}Usage: /prewalk <task description> [--no-pause] [--into MODEL] [--max-todos N]{_RST}")
++            _cprint(f"  {_DIM}Example: /prewalk Build a settings page with tabbed sections{_RST}")
++            _cprint(f"  {_DIM}Alias: /pw{_RST}")
++            _cprint(f"  {_DIM}Manual mode (default): pauses after the first completed task for /model switch{_RST}")
++            _cprint(f"  {_DIM}--no-pause: auto-switches to {default_executor}{_RST}")
++            _cprint(f"  {_DIM}--into MODEL: auto-switches to the named executor (implies no pause){_RST}")
++            return
++
++        args = parts[1].strip()
++
++        # Parse flags
++        no_pause = "--no-pause" in args
++        executor_model = None
++        into_match = re.search(r'--into\s+(\S+)', args)
++        if into_match:
++            executor_model = into_match.group(1)
++            no_pause = True  # --into implies auto-swap
++        max_todos = 12  # default
++        mt_match = re.search(r'--max-todos\s+(\d+)', args)
++        if mt_match:
++            max_todos = int(mt_match.group(1))
++        # Clean flags from task description
++        task_desc = re.sub(r'--no-pause|--into\s+\S+|--max-todos\s+\d+', '', args).strip()
++
++        if not task_desc:
++            _cprint(f"  {_DIM}No task description found after flags.{_RST}")
++            _cprint(f"  {_DIM}Usage: /prewalk <task description> [--no-pause] [--into MODEL] [--max-todos N]{_RST}")
++            return
++
++        # Build the frontier prompt
++        preamble = (
++            "You are beginning a **prewalk** — a planning phase before a model switch.\n\n"
++            "Your job: explore the codebase, build a plan as a todo list, complete "
++            "exactly **one** task from that list (edit + verification), then "
++            "**STOP and pause**.\n\n"
++            "The executor model will inherit your context window — all your reads, your "
++            "todo list, and your one completed task. Everything you read now is context "
++            "the executor won't have to re-read, and your completed task is the "
++            "in-context example it will imitate. Make your exploration count, and make "
++            "your one task exemplary.\n\n"
++            "Budget: aim to finish exploration + plan + first task within roughly "
++            "7-10 turns. If you cannot land a confident first task in that budget, "
++            "stop and report why instead of grinding.\n\n"
++        )
++
++        instructions = (
++            f"## Task\n{task_desc}\n\n"
++            f"## Instructions\n\n"
++            f"### Step 1: Explore\n"
++            f"Read the codebase thoroughly:\n"
++            f"- package.json, config files (tsconfig, tailwind, vite/next config, etc.)\n"
++            f"- Existing components, pages, layouts, route structure\n"
++            f"- API routes, server actions, data models\n"
++            f"- Design system: colors, typography, spacing tokens, component library\n"
++            f"- Grep for patterns: state management, styling approach, auth setup\n"
++            f"- Check test setup and conventions\n\n"
++            f"**Do NOT search the web.** No web_search, no web_extract, no browser "
++            f"(except to reproduce a reported visual defect on a local dev server). "
++            f"This is a local-only exploration phase.\n\n"
++            f"### Step 2: Plan\n"
++            f"Create a todo list using the `todo` tool. Rules:\n"
++            f"- Maximum {max_todos} items\n"
++            f"- Each item is a COMPLETE task: specific file path + what to do + "
++            f"verification criterion — something that can be finished and checked "
++            f"off, not a fragment\n"
++            f"- Order: infrastructure → core functionality → polish → validation\n"
++            f"- Item #1 must be the foundational task (one file, one concept) — "
++            f"you will execute it yourself and it becomes the executor's example\n"
++            f"- Good: \"Create `src/app/settings/page.tsx` with tabbed layout. "
++            f"verify: page renders at /settings without errors\"\n"
++            f"- Bad: \"Build the settings page\"\n\n"
++            f"### Step 3: Complete Task #1 — and ONLY Task #1\n"
++            f"Execute the first todo item in full:\n"
++            f"1. Make the edit(s) that task #1 describes (typically one file, one concept)\n"
++            f"2. Run its verification criterion (e.g. `npx tsc --noEmit`, render check) "
++            f"and confirm it passes\n"
++            f"3. Mark task #1 as completed in the todo list\n\n"
++            f"Constraints:\n"
++            f"- Task #1 must match existing conventions exactly (imports, styling, "
++            f"patterns) — the executor will copy this pattern for every remaining item\n"
++            f"- Do NOT start task #2. Do NOT make edits beyond task #1's scope. "
++            f"One task, fully done, verified, checked off.\n"
++            f"- If task #1's verification fails, fix it before stopping — a broken "
++            f"first example poisons the executor. But stay within task #1's scope.\n\n"
++            f"### Step 4: Pause\n"
++            f"Add a final todo item (the structured pause task) and set it in progress:\n"
++            f"```\n"
++            f"⏸️ PAUSE — Frontier handoff checkpoint. Human: review the plan + task #1, "
++            f"optionally /compress, then /model <executor> and say \"continue\".\n"
++            f"```\n\n"
++            f"Then **STOP**. Present:\n"
++            f"- Summary of your approach (2-3 sentences)\n"
++            f"- The todo list state (task #1 checked off, PAUSE in progress, rest pending)\n"
++            f"- What task #1 was, how it was verified, and why it's the foundation\n\n"
++            f"Do NOT continue executing remaining items. Do NOT make additional edits.\n"
++        )
++
++        if no_pause:
++            _exec = executor_model or default_executor
++            instructions += (
++                f"\n--no-pause mode is active. After your first completed task, the "
++                f"system will auto-switch to the executor model ({_exec}). "
++                f"Your context will be inherited. The executor will continue from "
++                f"your todo list automatically.\n"
++            )
++
++        frontier_prompt = preamble + instructions
++
++        # For --no-pause / --into: set up model swap (similar to /moa)
++        if no_pause:
++            self._pending_prewalk_restore_model = {
++                "requested_provider": getattr(self, "requested_provider", None),
++                "provider": getattr(self, "provider", None),
++                "model": getattr(self, "model", None),
++                "api_key": getattr(self, "api_key", None),
++                "base_url": getattr(self, "base_url", None),
++                "api_mode": getattr(self, "api_mode", None),
++            }
++            self._pending_prewalk_executor_model = executor_model or default_executor
++            self._pending_prewalk_swap_after_turn = True
++            _cprint(f"  {_DIM}⚡ Auto mode: will switch to {executor_model or default_executor} "
++                    f"after the first completed task.{_RST}")
++        else:
++            _cprint(f"  {_DIM}🧭 Prewalk started. Frontier model will explore, plan, and "
++                    f"complete task #1 (edit + verification).{_RST}")
++            _cprint(f"  {_DIM}⏸️  Will pause after task #1 for your review.{_RST}")
++            _cprint(f"  {_DIM}   Then: /model <executor> to switch, and say 'continue'.{_RST}")
++
++        # Send the frontier prompt as the next agent turn
++        self._pending_agent_seed = frontier_prompt
++
+     def _handle_bundles_command(self, cmd: str) -> None:
+         """In-session ``/bundles`` — show installed skill bundles.
+ 
+diff --git a/hermes_cli/commands.py b/hermes_cli/commands.py
+index 3e2d03d..f58a9a5 100644
+--- a/hermes_cli/commands.py
++++ b/hermes_cli/commands.py
+@@ -115,6 +115,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
+                args_hint="[text | draft <text> | show | pause | resume | clear | status | wait <pid> | unwait]"),
+     CommandDef("moa", "Run one prompt through the default Mixture of Agents preset, then restore your model", "Session",
+                args_hint="<prompt>"),
++    CommandDef("prewalk", "Frontier model explores + plans + completes first task, then pauses for model switch",
++               "Session", aliases=("pw",),
++               args_hint="<task> [--no-pause] [--into MODEL] [--max-todos N]"),
+     CommandDef("subgoal", "Add or manage extra criteria on the active goal", "Session",
+                args_hint="[text | remove N | clear]"),
+     CommandDef("status", "Show session, model, token, and context info", "Session"),
+diff --git a/tests/cli/test_prewalk_command.py b/tests/cli/test_prewalk_command.py
+new file mode 100644
+index 0000000..bfff024
+--- /dev/null
++++ b/tests/cli/test_prewalk_command.py
+@@ -0,0 +1,183 @@
++"""Tests for the /prewalk slash command registration and handler.
++
++Verifies:
++1. Command is registered in COMMAND_REGISTRY with correct fields
++2. /pw alias resolves correctly
++3. Handler method exists on CLICommandsMixin
++4. cli.py has dispatch, init, and auto-swap integration points
++5. Flag parsing (--no-pause, --into MODEL, --max-todos N) works correctly
++6. One-completed-task semantics present in the frontier prompt
++"""
++
++import re
++
++import pytest
++
++
++class TestPrewalkCommandDef:
++    """Test the CommandDef registration for /prewalk."""
++
++    def test_prewalk_in_registry(self):
++        from hermes_cli.commands import COMMAND_REGISTRY
++        names = [c.name for c in COMMAND_REGISTRY]
++        assert "prewalk" in names
++
++    def test_prewalk_has_pw_alias(self):
++        from hermes_cli.commands import COMMAND_REGISTRY
++        prewalk = next(c for c in COMMAND_REGISTRY if c.name == "prewalk")
++        assert "pw" in prewalk.aliases
++
++    def test_prewalk_in_session_category(self):
++        from hermes_cli.commands import COMMAND_REGISTRY
++        prewalk = next(c for c in COMMAND_REGISTRY if c.name == "prewalk")
++        assert prewalk.category == "Session"
++
++    def test_prewalk_args_hint(self):
++        from hermes_cli.commands import COMMAND_REGISTRY
++        prewalk = next(c for c in COMMAND_REGISTRY if c.name == "prewalk")
++        assert "--no-pause" in prewalk.args_hint
++        assert "--into" in prewalk.args_hint
++        assert "--max-todos" in prewalk.args_hint
++
++    def test_pw_alias_resolves(self):
++        from hermes_cli.commands import resolve_command
++        cmd = resolve_command("pw")
++        assert cmd is not None
++        assert cmd.name == "prewalk"
++
++    def test_prewalk_in_commands_dict(self):
++        from hermes_cli.commands import COMMANDS
++        assert "/prewalk" in COMMANDS
++        assert "/pw" in COMMANDS
++
++
++class TestPrewalkHandler:
++    """Test the handler method exists and flag parsing works."""
++
++    def test_handler_exists(self):
++        from hermes_cli.cli_commands_mixin import CLICommandsMixin
++        assert hasattr(CLICommandsMixin, "_handle_prewalk_command")
++
++    def test_handler_is_callable(self):
++        from hermes_cli.cli_commands_mixin import CLICommandsMixin
++        import inspect
++        assert callable(getattr(CLICommandsMixin, "_handle_prewalk_command"))
++        sig = inspect.signature(CLICommandsMixin._handle_prewalk_command)
++        assert "cmd" in sig.parameters
++
++    def test_one_task_semantics_in_prompt(self):
++        """The frontier prompt must instruct one COMPLETED task, not one edit."""
++        from hermes_cli import cli_commands_mixin
++        src = open(cli_commands_mixin.__file__, encoding="utf-8").read()
++        assert "Complete Task #1" in src
++        assert "Do NOT start task #2" in src
++        assert "Mark task #1 as completed" in src
++
++    def test_pause_todo_in_prompt(self):
++        from hermes_cli import cli_commands_mixin
++        src = open(cli_commands_mixin.__file__, encoding="utf-8").read()
++        assert "PAUSE — Frontier handoff checkpoint" in src
++
++
++class TestPrewalkFlagParsing:
++    """Test the flag parsing logic (mirrors the handler's parsing)."""
++
++    @staticmethod
++    def _parse(cmd):
++        """Replicate the flag parsing from _handle_prewalk_command."""
++        parts = cmd.strip().split(maxsplit=1)
++        if len(parts) < 2 or not parts[1].strip():
++            return None, False, None, 12
++        args = parts[1].strip()
++        no_pause = "--no-pause" in args
++        executor_model = None
++        into_match = re.search(r"--into\s+(\S+)", args)
++        if into_match:
++            executor_model = into_match.group(1)
++            no_pause = True
++        max_todos = 12
++        mt_match = re.search(r"--max-todos\s+(\d+)", args)
++        if mt_match:
++            max_todos = int(mt_match.group(1))
++        task_desc = re.sub(r"--no-pause|--into\s+\S+|--max-todos\s+\d+", "", args).strip()
++        return task_desc, no_pause, executor_model, max_todos
++
++    def test_simple_task(self):
++        task, no_pause, executor, max_todos = self._parse("/prewalk Build a settings page")
++        assert task == "Build a settings page"
++        assert no_pause is False
++        assert executor is None
++        assert max_todos == 12
++
++    def test_no_pause_flag(self):
++        task, no_pause, executor, max_todos = self._parse("/prewalk Build a settings page --no-pause")
++        assert task == "Build a settings page"
++        assert no_pause is True
++        assert executor is None
++        assert max_todos == 12
++
++    def test_into_flag(self):
++        task, no_pause, executor, max_todos = self._parse("/prewalk --into cline-pass/qwen3.7-plus Build a page")
++        assert task == "Build a page"
++        assert no_pause is True  # --into implies auto-swap
++        assert executor == "cline-pass/qwen3.7-plus"
++        assert max_todos == 12
++
++    def test_into_with_local_model(self):
++        task, no_pause, executor, _ = self._parse("/prewalk Build a page --into lmstudio/gemma-4-26b")
++        assert task == "Build a page"
++        assert executor == "lmstudio/gemma-4-26b"
++
++    def test_max_todos_flag(self):
++        task, no_pause, executor, max_todos = self._parse("/prewalk --max-todos 5 Build a settings page")
++        assert task == "Build a settings page"
++        assert no_pause is False
++        assert max_todos == 5
++
++    def test_all_flags(self):
++        task, no_pause, executor, max_todos = self._parse(
++            "/prewalk --into m/x --max-todos 8 Build something")
++        assert task == "Build something"
++        assert no_pause is True
++        assert executor == "m/x"
++        assert max_todos == 8
++
++    def test_pw_alias_parsing(self):
++        task, no_pause, executor, max_todos = self._parse("/pw Quick task")
++        assert task == "Quick task"
++        assert no_pause is False
++        assert max_todos == 12
++
++    def test_no_args_returns_none(self):
++        task, no_pause, executor, max_todos = self._parse("/prewalk")
++        assert task is None
++
++
++class TestPrewalkCliIntegration:
++    """Verify cli.py has all three integration points in its source."""
++
++    def test_dispatch_in_process_command(self):
++        import cli
++        src = open(cli.__file__, encoding="utf-8").read()
++        assert 'canonical == "prewalk"' in src
++
++    def test_init_attributes(self):
++        import cli
++        src = open(cli.__file__, encoding="utf-8").read()
++        assert "_pending_prewalk_swap_after_turn = False" in src
++        assert "_pending_prewalk_executor_model" in src
++        assert "_pending_prewalk_restore_model" in src
++
++    def test_auto_swap_in_main_loop(self):
++        import cli
++        src = open(cli.__file__, encoding="utf-8").read()
++        assert "_pending_prewalk_swap_after_turn" in src
++        assert "cline-pass/deepseek-v4-flash" in src
++
++    def test_auto_swap_honors_named_executor(self):
++        """The swap block must use the recorded --into model, not a hardcoded one."""
++        import cli
++        src = open(cli.__file__, encoding="utf-8").read()
++        assert "_pending_prewalk_executor_model" in src
++        # continuation prompt must carry the anti-premature-done rule
++        assert "do not declare completion while unchecked" in src

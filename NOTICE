@@ -1,0 +1,31 @@
+NOTICE
+======
+
+Prewalk Technique Attribution
+------------------------------
+
+The prewalk technique implemented by this repository was published by:
+
+    Can Bölük / Stencil
+    "You only need the frontier model for one single edit"
+    2026-07-13
+    https://stencil.so/blog/prewalk
+
+Stencil upstreamed the technique to omp, where it ships natively as
+`--prewalk`, `--prewalk-into <model>`, or `/prewalk`.
+
+This repository is an independent implementation that extends the published
+technique with:
+
+- One-completed-task semantics (edit + verification, not just a scaffold edit)
+- A structured PAUSE checkpoint todo for human review at the handoff
+- A frontier-phase turn budget grounded in the article's behavioral findings
+- Executor anti-premature-completion rules
+- Frontend verification recipes (Playwright desktop screenshots, DOM geometry
+  probes, CSS animation cost diagnosis)
+- A task-selection rubric and worked scouting procedure
+- Hermes Agent bindings (slash command, skill packaging)
+
+The MIT License in LICENSE covers the code and documents in this repository.
+The underlying technique belongs to its author; if you reuse prewalk, please
+cite the original article above.

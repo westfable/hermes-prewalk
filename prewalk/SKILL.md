@@ -10,13 +10,16 @@ metadata:
     tags: [prewalk, planning, model-switching, web-app, design, cost-optimization]
     homepage: https://stencil.so/blog/prewalk
     related_skills: [plan, todo]
+attribution: "Technique by Can Bölük / Stencil (2026-07-13). See NOTICE for details."
 ---
 
 # Prewalk: Frontier Planning + Executor Handoff
 
 Hand off the **context window**, not a plan document. The frontier model explores, creates a todo list, completes exactly one task (edit + verification), then pauses. The executor inherits all the exploration context, the todo list as a steering mechanism, and one completed, verified task as an in-context example.
 
-Based on [Stencil's prewalk research](https://stencil.so/blog/prewalk): the expensive part of an agent's work is **reading** (91% of tokens), not editing (9%). Traditional `/plan` makes the frontier model read everything at frontier prices, write a 2K-token "postcard", then the cheap model re-reads everything to execute — you pay for reads twice, and benchmarks show `/plan` costs *more* than no handoff at all. Full research, benchmarks, and the cheating-reduction effect: `references/concept.md`.
+Based on [prewalk research by Can Bölük / Stencil](https://stencil.so/blog/prewalk): the expensive part of an agent's work is **reading** (91% of tokens), not editing (9%). Traditional `/plan` makes the frontier model read everything at frontier prices, write a 2K-token "postcard", then the cheap model re-reads everything to execute — you pay for reads twice, and benchmarks show `/plan` costs *more* than no handoff at all. Full research, benchmarks, and the cheating-reduction effect: `references/concept.md`.
+
+The core prompt files (`references/prompt-frontier.md` and `references/prompt-executor.md`) are written to be harness-neutral — they can be used with any agent that supports a todo/task-list tool and mid-session model switches. Hermes-specific details are relegated to bindings notes at the end of each file. See [`references/prompt-frontier.md`](references/prompt-frontier.md) and [`references/prompt-executor.md`](references/prompt-executor.md) for the prompts, and the "Using Prewalk Outside Hermes" section of this repo's README for agent-agnostic usage.
 
 ## When to Use
 
@@ -176,8 +179,8 @@ The ⏸️ PAUSE is for the initial handoff only, never for iterations.
 | File | Contents |
 |---|---|
 | `references/concept.md` | Research, benchmarks, turn-budget rationale, cheating-reduction data (condensed from the Stencil article) |
-| `references/prompt-frontier.md` | Full Phase 1 instruction the slash command constructs |
-| `references/prompt-executor.md` | Full Phase 3 continuation prompt |
+| `references/prompt-frontier.md` | Full Phase 1 instruction (harness-neutral; Hermes bindings at end) |
+| `references/prompt-executor.md` | Full Phase 3 continuation prompt (harness-neutral; Hermes bindings at end) |
 | `references/model-selection.md` | Frontier/executor pairing guidance + full cline-pass model list |
 | `references/task-selection.md` | 6-point rubric + scouting procedure for picking prewalk tasks |
 | `references/plan-design-review.md` | Plan-mode design review: patterns to challenge before saving, Framer Motion gotchas, patch discipline |
